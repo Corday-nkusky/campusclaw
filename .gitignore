@@ -1,0 +1,13 @@
+# 本机配置（含真实口令/密钥），永远不入库；模板见 .env.example
+.env
+
+# 本地运行产物（运行时生成，不属于项目源码）
+.workbuddy/
+.tmp/
+.verify-logs/
+storage/
+backend/bin/
+backend/uploads/m-*
+frontend/dist/
+node_modules/
+*.log

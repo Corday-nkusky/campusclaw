@@ -1,0 +1,159 @@
+# CampusClaw 迭代 1 · 标准启动方式（R8）
+#
+# 用法（在**仓库根目录**执行）：
+#     cp .env.example deploy/.env          # 再填入真实值
+#     docker compose -f deploy/compose.yaml up -d
+#     浏览器打开 http://127.0.0.1:8080
+#
+#     docker compose -f deploy/compose.yaml down      # 数据仍在（卷不删）
+#     docker compose -f deploy/compose.yaml down -v   # ⚠️ 连卷一起删，数据没了
+#
+# compose 会在**本文件所在目录**找 .env，所以配置放 deploy/.env（已 gitignore）。
+#
+# ── 与 R8.3 的对应关系 ────────────────────────────────────────
+#   web     发布宿主端口（唯一一个）
+#   api     只在内部网络，宿主不可达
+#   db      只在内部网络，宿主不可达
+#   qdrant  只在内部网络，宿主不可达，也不经 web 反代（迭代 2 · R8.3）
+# 判定方法：`docker compose ps` 的 PORTS 列只有 web 一行带 `0.0.0.0:` 前缀。
+
+name: campusclaw
+
+services:
+  # ── 数据库 ──────────────────────────────────────────────────
+  db:
+    image: mysql:8.0
+    restart: unless-stopped
+    environment:
+      # 管理员口令**只给 db 服务**，不下发给 api（R7.3）。
+      # 冒号后无默认值：缺了就启动失败，避免悄悄用一个人人皆知的弱口令。
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?缺 MYSQL_ROOT_PASSWORD，请在 deploy/.env 里设置}
+      # 由官方镜像的 entrypoint 建库建普通账号 —— 应用侧用的就是这个普通账号
+      MYSQL_DATABASE: ${DB_NAME:-campusclaw}
+      MYSQL_USER: ${DB_USER:-campusclaw}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?缺 DB_PASSWORD，请在 deploy/.env 里设置}
+      TZ: Asia/Shanghai
+    command:
+      # utf8mb4 必须在**服务端**定死：否则中文材料标题、知识库正文会按
+      # latin1/utf8 存储，读回来是乱码。collation 用 0900_ai_ci（MySQL 8 默认）。
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_0900_ai_ci
+      # 单实例、单客户端连接池，连接数开小一点没有坏处
+      - --max-connections=100
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      # depends_on 只保证「容器起来了」，不保证「MySQL 能连」。
+      # 这里用 mysqladmin ping 把「能连」这件事暴露成健康状态，
+      # api 侧再用 service_healthy 等它 —— 但即便如此，应用侧仍保留了
+      # 自己的重试等待（见 backend/cmd/server/main.go 的 retryBootstrap），
+      # 因为 healthcheck 也会误判（例如初始化完成后短暂拒连）。
+      #
+      # ⚠️ 必须是 CMD-SHELL 而不是 CMD：CMD 是 exec 形式、不经过 shell，
+      #    `$MYSQL_ROOT_PASSWORD` 不会被展开，mysqladmin 会收到字面量。`$$` 是
+      #    compose 的转义，落到容器里是单个 `$`。
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
+    networks:
+      - internal
+    # ⚠️ 刻意**不写** ports：db 不对宿主暴露（R8.3）
+
+  # ── 应用 ────────────────────────────────────────────────────
+  api:
+    build:
+      context: ..
+      dockerfile: deploy/api.Dockerfile
+    restart: unless-stopped
+    environment:
+      DB_HOST: db
+      DB_PORT: "3306"
+      DB_NAME: ${DB_NAME:-campusclaw}
+      DB_USER: ${DB_USER:-campusclaw}
+      DB_PASSWORD: ${DB_PASSWORD:?缺 DB_PASSWORD，请在 deploy/.env 里设置}
+
+      SESSION_SECRET: ${SESSION_SECRET:?缺 SESSION_SECRET，请在 deploy/.env 里设置}
+      # add-refresh-token：access 短、refresh 长。均有默认值（15 分钟 / 30 天），
+      # SESSION_TTL_HOURS 仅作 access TTL 的兼容回退。
+      SESSION_TTL_HOURS: ${SESSION_TTL_HOURS:-24}
+      ACCESS_TTL_MINUTES: ${ACCESS_TTL_MINUTES:-15}
+      REFRESH_TTL_DAYS: ${REFRESH_TTL_DAYS:-30}
+
+      # 容器内固定路径，与下面的卷挂载点一致。
+      # 这里**不**从 .env 读 UPLOAD_DIR —— 宿主机那个绝对路径在容器里没有意义。
+      UPLOAD_DIR: /app/uploads
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-2097152}
+
+      SEED_TEACHER_PASSWORD: ${SEED_TEACHER_PASSWORD:?缺 SEED_TEACHER_PASSWORD}
+      SEED_STUDENT_PASSWORD: ${SEED_STUDENT_PASSWORD:?缺 SEED_STUDENT_PASSWORD}
+
+      LOGIN_FAIL_THRESHOLD: ${LOGIN_FAIL_THRESHOLD:-5}
+      LOGIN_LOCK_MINUTES: ${LOGIN_LOCK_MINUTES:-15}
+
+      # ── 迭代 2 · 检索九项（R8.1：缺任一项 api 启动失败）────────
+      # 网关四项 + 对话三项是外部服务的接入参数，KEY 属敏感项强制必填；
+      # 模型名与维度也强制必填 —— 维度错一个数字，Qdrant 集合就建错（R7.4）。
+      EMBEDDING_API_BASE: ${EMBEDDING_API_BASE:?缺 EMBEDDING_API_BASE，请在 deploy/.env 里设置}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:?缺 EMBEDDING_API_KEY，请在 deploy/.env 里设置}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:?缺 EMBEDDING_MODEL，请在 deploy/.env 里设置}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:?缺 EMBEDDING_DIM，请在 deploy/.env 里设置}
+      CHAT_API_BASE: ${CHAT_API_BASE:?缺 CHAT_API_BASE，请在 deploy/.env 里设置}
+      CHAT_API_KEY: ${CHAT_API_KEY:?缺 CHAT_API_KEY，请在 deploy/.env 里设置}
+      CHAT_MODEL: ${CHAT_MODEL:?缺 CHAT_MODEL，请在 deploy/.env 里设置}
+      # Qdrant 走 compose 内部网络的服务名，容器内固定，不需要 deploy/.env 提供
+      QDRANT_URL: http://qdrant:6333
+      QDRANT_COLLECTION: ${QDRANT_COLLECTION:-campusclaw_chunks}
+
+      API_PORT: "8080"
+      TZ: Asia/Shanghai
+    volumes:
+      # 上传件必须落卷，否则 `down` 之后文件没了、数据库行还在，
+      # 表现为「列表里有材料但下载 404」。
+      - uploads:/app/uploads
+    depends_on:
+      db:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    networks:
+      - internal
+    # ⚠️ 刻意**不写** ports：api 不单独暴露，外部只能经 web（R8.3）
+
+  # ── 向量库（迭代 2 · R8.3）───────────────────────────────────
+  qdrant:
+    # tag 按需升级；本机无 Docker，实跑留证仍列未验证（R8.5）
+    image: qdrant/qdrant:v1.12.4
+    restart: unless-stopped
+    volumes:
+      # 向量集合落卷：`down` 不删卷，集合与数据仍在；`down -v` 才清空
+      - qdrant-data:/qdrant/storage
+    networks:
+      - internal
+    # ⚠️ 刻意**不写** ports：qdrant 不对宿主暴露，也不经 web 反代（R8.3）
+
+  # ── Web（静态资源 + 反代）────────────────────────────────────
+  web:
+    build:
+      context: ..
+      dockerfile: deploy/web.Dockerfile
+    restart: unless-stopped
+    ports:
+      # 全栈唯一映射到宿主的服务。左边可按需改，右边固定 80。
+      - "${WEB_PORT:-8080}:80"
+    depends_on:
+      - api
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  # 命名卷：`docker compose down` **不删**卷，所以再次 up 数据仍在（R8.2）；
+  # 只有显式 `down -v` 才会清空。
+  db-data:
+  uploads:
+  qdrant-data:
